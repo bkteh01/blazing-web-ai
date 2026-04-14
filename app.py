@@ -1,36 +1,29 @@
 import streamlit as st
 import psycopg2
-import os
 
-# ======================
-# 页面设置（必须最前）
-# ======================
+# 页面设置
 st.set_page_config(
     page_title="BlazinGM Dashboard",
     page_icon="🎮",
     layout="wide"
 )
 
-# ======================
-# 数据库连接（Railway + Supabase）
-# ======================
-@st.cache_resource
-def get_connection():
-    DATABASE_URL = os.getenv("DATABASE_URL")
+# ✅ 直接写死连接（测试用）
+try:
+    conn = psycopg2.connect(
+        host="aws-1-ap-southeast-2.pooler.supabase.com",
+        database="postgres",
+        user="postgres.jpfqogcehayhetfdxubl",  # ❗重点
+        password="ZRDCj5vkdOZ1wdFS",
+        port=5432,
+        sslmode="require"
+    )
 
-    if not DATABASE_URL:
-        st.error("❌ DATABASE_URL not found")
-        st.stop()
+    st.success("✅ Database connected successfully!")
 
-    try:
-        conn = psycopg2.connect(DATABASE_URL)
-        return conn
-    except Exception as e:
-        st.error(f"❌ Database connection failed: {e}")
-        st.stop()
-
-conn = get_connection()
-c = conn.cursor()
+except Exception as e:
+    st.error(f"❌ Database connection failed: {e}")
+    st.stop()
 
 # ======================
 # Session 初始化
