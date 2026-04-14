@@ -14,7 +14,7 @@ try:
         host="aws-1-ap-southeast-2.pooler.supabase.com",
         database="postgres",
         user="postgres.jpfqogcehayhetfdxubl",  # ❗重点
-        password="vzuqqewYd0sfqGFq",
+        password="BlazinGM@2026#Secure",
         port=5432,
         sslmode="require"
     )
