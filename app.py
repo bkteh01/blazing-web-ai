@@ -3,7 +3,7 @@ import psycopg2
 import os
 
 # ======================
-# 页面设置
+# 页面设置（必须最前）
 # ======================
 st.set_page_config(
     page_title="BlazinGM Dashboard",
@@ -14,9 +14,22 @@ st.set_page_config(
 # ======================
 # 数据库连接（Railway + Supabase）
 # ======================
-DATABASE_URL = os.getenv("DATABASE_URL")
+@st.cache_resource
+def get_connection():
+    DATABASE_URL = os.getenv("DATABASE_URL")
 
-conn = psycopg2.connect(DATABASE_URL)
+    if not DATABASE_URL:
+        st.error("❌ DATABASE_URL not found")
+        st.stop()
+
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        return conn
+    except Exception as e:
+        st.error(f"❌ Database connection failed: {e}")
+        st.stop()
+
+conn = get_connection()
 c = conn.cursor()
 
 # ======================
