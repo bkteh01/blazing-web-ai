@@ -1,8 +1,9 @@
 import streamlit as st
 import psycopg2
+import os
 
 # ======================
-# 页面设置（必须最前）
+# 页面设置
 # ======================
 st.set_page_config(
     page_title="BlazinGM Dashboard",
@@ -11,12 +12,11 @@ st.set_page_config(
 )
 
 # ======================
-# 数据库连接（Supabase）
+# 数据库连接（Railway + Supabase）
 # ======================
-conn = psycopg2.connect(
-    "dbname=postgres user=postgres password=Bk39294229@ host=db.jpfqogcehayhetfdxubl.supabase.co port=5432 sslmode=require"
-)
+DATABASE_URL = os.getenv("DATABASE_URL")
 
+conn = psycopg2.connect(DATABASE_URL)
 c = conn.cursor()
 
 # ======================
