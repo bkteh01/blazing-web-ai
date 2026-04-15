@@ -1,10 +1,14 @@
+import os
 from datetime import datetime
 from uuid import uuid4
 
 import pandas as pd
 import psycopg2
+import requests
 from psycopg2 import extensions
 import streamlit as st
+
+from db_utils import ensure_customer_messages_table, save_admin_reply
 
 
 st.set_page_config(
@@ -228,8 +232,7 @@ PRODUCTS = [
 ]
 
 
-@st.cache_resource(show_spinner=False)
-def get_db_connection():
+def open_db_connection():
     return psycopg2.connect(
         host="aws-1-ap-southeast-2.pooler.supabase.com",
         database="postgres",
@@ -242,10 +245,34 @@ def get_db_connection():
 
 
 try:
-    conn = get_db_connection()
+    conn = open_db_connection()
 except Exception as e:
     st.error(f"Database connection failed: {e}")
     st.stop()
+
+
+def send_whatsapp_text_message(to_number, text):
+    access_token = os.getenv("WHATSAPP_ACCESS_TOKEN", "")
+    phone_number_id = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
+
+    if not access_token or not phone_number_id:
+        raise ValueError("WhatsApp environment variables are not configured.")
+
+    response = requests.post(
+        f"https://graph.facebook.com/v22.0/{phone_number_id}/messages",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "messaging_product": "whatsapp",
+            "to": to_number,
+            "type": "text",
+            "text": {"body": text[:4096]},
+        },
+        timeout=15,
+    )
+    response.raise_for_status()
 
 
 if "user" not in st.session_state:
@@ -254,13 +281,44 @@ if "user" not in st.session_state:
 if "is_admin" not in st.session_state:
     st.session_state["is_admin"] = False
 
+if "session_token" not in st.session_state:
+    st.session_state["session_token"] = None
+
+if "login_token_ready" not in st.session_state:
+    st.session_state["login_token_ready"] = None
+
 
 def reset_failed_transaction():
+    global conn
     try:
+        if conn.closed:
+            conn = open_db_connection()
         if conn.get_transaction_status() == extensions.TRANSACTION_STATUS_INERROR:
             conn.rollback()
     except Exception:
-        pass
+        conn = open_db_connection()
+
+
+def ensure_login_token_column():
+    try:
+        return fetch_one(
+            """
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = 'users'
+              AND column_name = 'login_token'
+            LIMIT 1
+            """
+        ) is not None
+    except Exception:
+        return False
+
+
+def login_token_enabled():
+    if st.session_state["login_token_ready"] is None:
+        st.session_state["login_token_ready"] = ensure_login_token_column()
+    return st.session_state["login_token_ready"]
 
 
 def fetch_one(query, params=None):
@@ -297,8 +355,52 @@ def execute_write(query, params=None):
         raise
 
 
+def set_active_login_token(username, token):
+    if not login_token_enabled():
+        return
+    execute_write(
+        "UPDATE users SET login_token=%s WHERE username=%s",
+        (token, username),
+    )
+
+
+def clear_active_login_token(username, token):
+    if not login_token_enabled():
+        return
+    execute_write(
+        "UPDATE users SET login_token=NULL WHERE username=%s AND login_token=%s",
+        (username, token),
+    )
+
+
+def session_still_valid():
+    if not st.session_state["user"]:
+        return True
+    if not login_token_enabled() or not st.session_state["session_token"]:
+        return True
+
+    token_row = fetch_one(
+        "SELECT login_token FROM users WHERE username=%s",
+        (st.session_state["user"],),
+    )
+    current_token = token_row[0] if token_row else None
+    return current_token == st.session_state["session_token"]
+
+
+def force_logout_due_to_other_login():
+    st.session_state["user"] = None
+    st.session_state["is_admin"] = False
+    st.session_state["session_token"] = None
+    st.warning("This account was logged in on another device. You have been signed out.")
+    st.stop()
+
+
 def generate_order_number():
-    return f"ORD-{datetime.now().strftime('%Y%m%d')}-{uuid4().hex[:8].upper()}"
+    return f"BGM-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid4().hex[:12].upper()}"
+
+
+def build_fallback_order_ref(order_id):
+    return f"BGM-REF-{int(order_id):08d}"
 
 
 def ensure_order_number_column():
@@ -367,19 +469,30 @@ def create_order(username, game_name, amount):
     if order_numbers_enabled():
         order_no = generate_order_number()
         try:
-            execute_write(
-                "INSERT INTO orders (order_no, user_id, game, amount, status) VALUES (%s, %s, %s, %s, %s)",
+            result = fetch_one(
+                "INSERT INTO orders (order_no, user_id, game, amount, status) VALUES (%s, %s, %s, %s, %s) RETURNING id, order_no",
                 (order_no, username, game_name, amount, "pending"),
             )
-            return order_no
+            conn.commit()
+            return result[1] if result and result[1] else order_no
         except psycopg2.errors.UndefinedColumn:
+            conn.rollback()
             st.session_state["order_no_ready"] = False
 
-    execute_write(
-        "INSERT INTO orders (user_id, game, amount, status) VALUES (%s, %s, %s, %s)",
-        (username, game_name, amount, "pending"),
-    )
-    return None
+    try:
+        result = fetch_one(
+            "INSERT INTO orders (user_id, game, amount, status) VALUES (%s, %s, %s, %s) RETURNING id",
+            (username, game_name, amount, "pending"),
+        )
+        conn.commit()
+        return build_fallback_order_ref(result[0]) if result and result[0] is not None else None
+    except Exception:
+        conn.rollback()
+        execute_write(
+            "INSERT INTO orders (user_id, game, amount, status) VALUES (%s, %s, %s, %s)",
+            (username, game_name, amount, "pending"),
+        )
+        return None
 
 
 def render_account_shell(title, subtitle):
@@ -399,16 +512,24 @@ def show_user_panel():
     )
     balance = balance_row[0] if balance_row else 0
 
-    if order_numbers_enabled():
+    try:
         orders = fetch_all(
-            "SELECT order_no, game, amount, status FROM orders WHERE user_id=%s ORDER BY order_no DESC",
+            "SELECT id, order_no, game, amount, status FROM orders WHERE user_id=%s ORDER BY id DESC",
             (st.session_state["user"],),
         )
-    else:
+        orders_with_ref = [
+            (order_no or build_fallback_order_ref(order_id), game, amount, status)
+            for order_id, order_no, game, amount, status in orders
+        ]
+    except Exception:
         orders = fetch_all(
-            "SELECT game, amount, status FROM orders WHERE user_id=%s",
+            "SELECT id, game, amount, status FROM orders WHERE user_id=%s ORDER BY id DESC",
             (st.session_state["user"],),
         )
+        orders_with_ref = [
+            (build_fallback_order_ref(order_id), game, amount, status)
+            for order_id, game, amount, status in orders
+        ]
 
     st.markdown('<div class="glass-card">', unsafe_allow_html=True)
     render_section("Wallet", "Your account snapshot updates in real time.")
@@ -423,43 +544,42 @@ def show_user_panel():
     )
 
     render_section("My Orders", "Recent purchases and their current processing status.")
-    if orders:
-        if order_numbers_enabled():
-            for order_no, game, amount, status in orders:
-                st.markdown(
-                    f"""
-                    <div class="order-item">
-                        <div><strong>{game}</strong></div>
-                        <div class="tiny-label">Order No: {order_no}</div>
-                        <div class="tiny-label">Amount: RM {amount} · Status: {status}</div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-        else:
-            for game, amount, status in orders:
-                st.markdown(
-                    f"""
-                    <div class="order-item">
-                        <div><strong>{game}</strong></div>
-                        <div class="tiny-label">Amount: RM {amount} · Status: {status}</div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
+    if orders_with_ref:
+        for order_ref, game, amount, status in orders_with_ref:
+            st.markdown(
+                f"""
+                <div class="order-item">
+                    <div><strong>{game}</strong></div>
+                    <div class="tiny-label">Full Order No: {order_ref}</div>
+                    <div class="tiny-label">Amount: RM {amount} · Status: {status}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
     else:
         st.info("You have no orders yet.")
     end_card()
 
     if st.sidebar.button("Logout"):
+        try:
+            clear_active_login_token(
+                st.session_state["user"],
+                st.session_state["session_token"],
+            )
+        except Exception:
+            pass
         st.session_state["user"] = None
         st.session_state["is_admin"] = False
+        st.session_state["session_token"] = None
         st.rerun()
 
 
 menu = ["Home", "Login", "Register"]
 if st.session_state["is_admin"]:
     menu.append("Admin")
+
+if st.session_state["user"] and not session_still_valid():
+    force_logout_due_to_other_login()
 
 st.sidebar.markdown("## BlazinGM")
 st.sidebar.caption("Gaming top-up console")
@@ -485,7 +605,7 @@ if choice == "Home":
                             product["price"],
                         )
                         if order_no:
-                            st.success(f"Order created! Your order number is {order_no}")
+                            st.success(f"Order created! Full order number: {order_no}")
                         else:
                             st.success("Order created!")
                     except Exception as e:
@@ -521,13 +641,16 @@ elif choice == "Login":
         if st.button("Login"):
             try:
                 result = fetch_one(
-                    "SELECT * FROM users WHERE username=%s AND password=%s",
+                    "SELECT username FROM users WHERE username=%s AND password=%s",
                     (user, password),
                 )
 
                 if result:
+                    session_token = uuid4().hex
+                    set_active_login_token(user, session_token)
                     st.session_state["user"] = user
                     st.session_state["is_admin"] = user_is_admin(user)
+                    st.session_state["session_token"] = session_token
                     st.success("Logged in!")
                     st.rerun()
                 else:
@@ -548,17 +671,32 @@ elif choice == "Admin":
         users = fetch_all("SELECT username, balance FROM users ORDER BY username")
         users_df = pd.DataFrame(users, columns=["Username", "Balance"])
 
-        if order_numbers_enabled():
+        try:
             orders = fetch_all(
-                "SELECT order_no, game, amount, status, user_id FROM orders ORDER BY order_no DESC"
+                "SELECT id, order_no, game, amount, status, user_id FROM orders ORDER BY id DESC"
             )
             orders_df = pd.DataFrame(
-                orders,
+                [
+                    (
+                        order_no or build_fallback_order_ref(order_id),
+                        game,
+                        amount,
+                        status,
+                        user_id,
+                    )
+                    for order_id, order_no, game, amount, status, user_id in orders
+                ],
                 columns=["Order No", "Game", "Amount", "Status", "User"],
             )
-        else:
-            orders = fetch_all("SELECT game, amount, status, user_id FROM orders ORDER BY user_id, game")
-            orders_df = pd.DataFrame(orders, columns=["Game", "Amount", "Status", "User"])
+        except Exception:
+            orders = fetch_all("SELECT id, game, amount, status, user_id FROM orders ORDER BY id DESC")
+            orders_df = pd.DataFrame(
+                [
+                    (build_fallback_order_ref(order_id), game, amount, status, user_id)
+                    for order_id, game, amount, status, user_id in orders
+                ],
+                columns=["Order No", "Game", "Amount", "Status", "User"],
+            )
 
         col_a, col_b, col_c = st.columns(3)
         col_a.metric("Users", len(users_df))
@@ -580,26 +718,104 @@ elif choice == "Admin":
             st.dataframe(orders_df, use_container_width=True)
             end_card()
 
+            st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+            render_section("Customer Inbox", "Structured customer messages captured from WhatsApp.")
+            try:
+                ensure_customer_messages_table()
+                inbox_rows = fetch_all(
+                    """
+                    SELECT id, sender_number, raw_message, detected_intent, order_reference,
+                           summary, priority, admin_reply, replied_at, created_at
+                    FROM customer_messages
+                    ORDER BY id DESC
+                    LIMIT 20
+                    """
+                )
+                inbox_df = pd.DataFrame(
+                    inbox_rows,
+                    columns=[
+                        "ID",
+                        "Sender",
+                        "Raw Message",
+                        "Intent",
+                        "Order Ref",
+                        "Summary",
+                        "Priority",
+                        "Admin Reply",
+                        "Replied At",
+                        "Created At",
+                    ],
+                )
+                if inbox_df.empty:
+                    st.info("No customer messages yet.")
+                else:
+                    st.dataframe(inbox_df, use_container_width=True)
+
+                    message_options = {
+                        f"#{row[0]} | {row[1]} | {row[5] or row[2][:40]}": {
+                            "id": row[0],
+                            "sender": row[1],
+                            "raw_message": row[2],
+                            "admin_reply": row[7] or "",
+                        }
+                        for row in inbox_rows
+                    }
+
+                    selected_message_label = st.selectbox(
+                        "Choose a customer message to reply",
+                        list(message_options.keys()),
+                        key="customer_inbox_reply_select",
+                    )
+                    selected_message = message_options[selected_message_label]
+
+                    st.text_area(
+                        "Customer message",
+                        value=selected_message["raw_message"],
+                        height=120,
+                        disabled=True,
+                        key="customer_inbox_raw_message",
+                    )
+
+                    admin_reply_text = st.text_area(
+                        "Reply to customer",
+                        value=selected_message["admin_reply"],
+                        height=120,
+                        key=f"customer_reply_text_{selected_message['id']}",
+                    )
+
+                    if st.button("Send WhatsApp Reply", key="send_customer_inbox_reply"):
+                        try:
+                            send_whatsapp_text_message(
+                                selected_message["sender"],
+                                admin_reply_text,
+                            )
+                            save_admin_reply(selected_message["id"], admin_reply_text)
+                            st.success("Reply sent to customer on WhatsApp.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Failed to send WhatsApp reply: {e}")
+            except Exception as e:
+                st.info(f"Customer inbox not ready yet: {e}")
+            end_card()
+
         with right:
             st.markdown('<div class="glass-card">', unsafe_allow_html=True)
             render_section("Update Order Status", "Adjust the status of an existing order.")
             try:
-                if order_numbers_enabled():
+                try:
                     order_rows = fetch_all(
                         "SELECT id, order_no, user_id, game, amount, status FROM orders ORDER BY id DESC"
                     )
-                else:
+                    order_options = {
+                        f"Order: {row[1] or build_fallback_order_ref(row[0])} | User: {row[2]} | {row[3]} | RM{row[4]} | {row[5]}": row[0]
+                        for row in order_rows
+                    }
+                except Exception:
                     order_rows = fetch_all(
                         "SELECT id, user_id, game, amount, status FROM orders ORDER BY id DESC"
                     )
-                if order_numbers_enabled():
                     order_options = {
-                        f"{row[1]} | {row[2]} | {row[3]} | RM{row[4]} | {row[5]}": row[0]
-                        for row in order_rows
-                    }
-                else:
-                    order_options = {
-                        f"#{row[0]} | {row[1]} | {row[2]} | RM{row[3]} | {row[4]}": row[0]
+                        f"Order: {build_fallback_order_ref(row[0])} | User: {row[1]} | {row[2]} | RM{row[3]} | {row[4]}": row[0]
                         for row in order_rows
                     }
 
@@ -631,6 +847,14 @@ if choice != "Admin":
 elif st.session_state["user"]:
     st.sidebar.success(f"Signed in as {st.session_state['user']}")
     if st.sidebar.button("Logout"):
+        try:
+            clear_active_login_token(
+                st.session_state["user"],
+                st.session_state["session_token"],
+            )
+        except Exception:
+            pass
         st.session_state["user"] = None
         st.session_state["is_admin"] = False
+        st.session_state["session_token"] = None
         st.rerun()
