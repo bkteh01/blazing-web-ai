@@ -3,6 +3,7 @@ from uuid import uuid4
 
 import pandas as pd
 import psycopg2
+from psycopg2 import extensions
 import streamlit as st
 
 
@@ -242,7 +243,6 @@ def get_db_connection():
 
 try:
     conn = get_db_connection()
-    cursor = conn.cursor()
 except Exception as e:
     st.error(f"Database connection failed: {e}")
     st.stop()
@@ -255,13 +255,55 @@ if "is_admin" not in st.session_state:
     st.session_state["is_admin"] = False
 
 
+def reset_failed_transaction():
+    try:
+        if conn.get_transaction_status() == extensions.TRANSACTION_STATUS_INERROR:
+            conn.rollback()
+    except Exception:
+        pass
+
+
+def fetch_one(query, params=None):
+    reset_failed_transaction()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(query, params or ())
+            return cursor.fetchone()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def fetch_all(query, params=None):
+    reset_failed_transaction()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(query, params or ())
+            return cursor.fetchall()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def execute_write(query, params=None):
+    reset_failed_transaction()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(query, params or ())
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+
+
 def generate_order_number():
     return f"ORD-{datetime.now().strftime('%Y%m%d')}-{uuid4().hex[:8].upper()}"
 
 
 def ensure_order_number_column():
     try:
-        cursor.execute(
+        return fetch_one(
             """
             SELECT 1
             FROM information_schema.columns
@@ -269,45 +311,8 @@ def ensure_order_number_column():
               AND table_name = 'orders'
               AND column_name = 'order_no'
             """
-        )
-        column_exists = cursor.fetchone() is not None
-
-        if not column_exists:
-            cursor.execute(
-                """
-                ALTER TABLE orders
-                ADD COLUMN IF NOT EXISTS order_no VARCHAR(32)
-                """
-            )
-
-        cursor.execute(
-            """
-            SELECT COUNT(*)
-            FROM orders
-            WHERE order_no IS NULL OR order_no = ''
-            """
-        )
-        missing_count = cursor.fetchone()[0]
-
-        if missing_count:
-            cursor.execute(
-                """
-                WITH numbered AS (
-                    SELECT ctid, ROW_NUMBER() OVER (ORDER BY ctid) AS rn
-                    FROM orders
-                    WHERE order_no IS NULL OR order_no = ''
-                )
-                UPDATE orders
-                SET order_no = 'ORD-LEGACY-' || LPAD(numbered.rn::text, 6, '0')
-                FROM numbered
-                WHERE orders.ctid = numbered.ctid
-                """
-            )
-
-        conn.commit()
-        return True
+        ) is not None
     except Exception:
-        conn.rollback()
         return False
 
 
@@ -322,26 +327,6 @@ def order_numbers_enabled():
 
 
 def user_is_admin(username):
-    try:
-        cursor.execute(
-            "SELECT role FROM users WHERE username=%s",
-            (username,),
-        )
-        result = cursor.fetchone()
-        return bool(result and str(result[0]).lower() == "admin")
-    except psycopg2.errors.UndefinedColumn:
-        conn.rollback()
-
-    try:
-        cursor.execute(
-            "SELECT is_admin FROM users WHERE username=%s",
-            (username,),
-        )
-        result = cursor.fetchone()
-        return bool(result and result[0])
-    except psycopg2.errors.UndefinedColumn:
-        conn.rollback()
-
     return username.lower() == "admin"
 
 
@@ -368,10 +353,9 @@ def render_section(title, subtitle):
 
 def render_game_card(product):
     tags_html = "".join([f'<span class="pill">{tag}</span>' for tag in product["tags"]])
-    st.markdown('<div class="game-card">', unsafe_allow_html=True)
     st.image(product["image"], use_container_width=True)
-    st.markdown(f'<div class="game-title">{product["name"]}</div>', unsafe_allow_html=True)
-    st.markdown(f'<div class="game-meta">{product["price_text"]}</div>', unsafe_allow_html=True)
+    st.markdown(f"**{product['name']}**")
+    st.caption(product["price_text"])
     st.markdown(f'<div class="pill-row">{tags_html}</div>', unsafe_allow_html=True)
 
 
@@ -382,18 +366,19 @@ def end_card():
 def create_order(username, game_name, amount):
     if order_numbers_enabled():
         order_no = generate_order_number()
-        cursor.execute(
-            "INSERT INTO orders (order_no, user_id, game, amount, status) VALUES (%s, %s, %s, %s, %s)",
-            (order_no, username, game_name, amount, "pending"),
-        )
-        conn.commit()
-        return order_no
+        try:
+            execute_write(
+                "INSERT INTO orders (order_no, user_id, game, amount, status) VALUES (%s, %s, %s, %s, %s)",
+                (order_no, username, game_name, amount, "pending"),
+            )
+            return order_no
+        except psycopg2.errors.UndefinedColumn:
+            st.session_state["order_no_ready"] = False
 
-    cursor.execute(
+    execute_write(
         "INSERT INTO orders (user_id, game, amount, status) VALUES (%s, %s, %s, %s)",
         (username, game_name, amount, "pending"),
     )
-    conn.commit()
     return None
 
 
@@ -408,24 +393,22 @@ def show_user_panel():
 
     st.sidebar.success(f"Signed in as {st.session_state['user']}")
 
-    cursor.execute(
+    balance_row = fetch_one(
         "SELECT balance FROM users WHERE username=%s",
         (st.session_state["user"],),
     )
-    balance = cursor.fetchone()[0]
+    balance = balance_row[0] if balance_row else 0
 
     if order_numbers_enabled():
-        cursor.execute(
+        orders = fetch_all(
             "SELECT order_no, game, amount, status FROM orders WHERE user_id=%s ORDER BY order_no DESC",
             (st.session_state["user"],),
         )
-        orders = cursor.fetchall()
     else:
-        cursor.execute(
+        orders = fetch_all(
             "SELECT game, amount, status FROM orders WHERE user_id=%s",
             (st.session_state["user"],),
         )
-        orders = cursor.fetchall()
 
     st.markdown('<div class="glass-card">', unsafe_allow_html=True)
     render_section("Wallet", "Your account snapshot updates in real time.")
@@ -495,16 +478,18 @@ if choice == "Home":
                 if not st.session_state["user"]:
                     st.warning("Please login first")
                 else:
-                    order_no = create_order(
-                        st.session_state["user"],
-                        product["name"],
-                        product["price"],
-                    )
-                    if order_no:
-                        st.success(f"Order created! Your order number is {order_no}")
-                    else:
-                        st.success("Order created!")
-            end_card()
+                    try:
+                        order_no = create_order(
+                            st.session_state["user"],
+                            product["name"],
+                            product["price"],
+                        )
+                        if order_no:
+                            st.success(f"Order created! Your order number is {order_no}")
+                        else:
+                            st.success("Order created!")
+                    except Exception as e:
+                        st.error(f"Order failed: {e}")
 
 elif choice == "Register":
     render_hero()
@@ -515,12 +500,14 @@ elif choice == "Register":
         new_pass = st.text_input("Password", type="password")
 
         if st.button("Register"):
-            cursor.execute(
-                "INSERT INTO users (username, password, balance) VALUES (%s, %s, %s)",
-                (new_user, new_pass, 0),
-            )
-            conn.commit()
-            st.success("Account created!")
+            try:
+                execute_write(
+                    "INSERT INTO users (username, password, balance) VALUES (%s, %s, %s)",
+                    (new_user, new_pass, 0),
+                )
+                st.success("Account created!")
+            except Exception as e:
+                st.error(f"Register failed: {e}")
         end_card()
 
 elif choice == "Login":
@@ -532,18 +519,21 @@ elif choice == "Login":
         password = st.text_input("Password", type="password")
 
         if st.button("Login"):
-            cursor.execute(
-                "SELECT * FROM users WHERE username=%s AND password=%s",
-                (user, password),
-            )
-            result = cursor.fetchone()
+            try:
+                result = fetch_one(
+                    "SELECT * FROM users WHERE username=%s AND password=%s",
+                    (user, password),
+                )
 
-            if result:
-                st.session_state["user"] = user
-                st.session_state["is_admin"] = user_is_admin(user)
-                st.success("Logged in!")
-            else:
-                st.error("Invalid login")
+                if result:
+                    st.session_state["user"] = user
+                    st.session_state["is_admin"] = user_is_admin(user)
+                    st.success("Logged in!")
+                    st.rerun()
+                else:
+                    st.error("Invalid login")
+            except Exception as e:
+                st.error(f"Login failed: {e}")
         end_card()
 
 elif choice == "Admin":
@@ -551,92 +541,96 @@ elif choice == "Admin":
         st.error("Admin access only")
         st.stop()
 
-    render_hero()
-    render_section("Admin Dashboard", "Track players, monitor orders, and update order status.")
+    try:
+        render_hero()
+        render_section("Admin Dashboard", "Track players, monitor orders, and update order status.")
 
-    cursor.execute("SELECT username, balance FROM users ORDER BY username")
-    users = cursor.fetchall()
-    users_df = pd.DataFrame(users, columns=["Username", "Balance"])
+        users = fetch_all("SELECT username, balance FROM users ORDER BY username")
+        users_df = pd.DataFrame(users, columns=["Username", "Balance"])
 
-    if order_numbers_enabled():
-        cursor.execute(
-            "SELECT order_no, game, amount, status, user_id FROM orders ORDER BY order_no DESC"
+        if order_numbers_enabled():
+            orders = fetch_all(
+                "SELECT order_no, game, amount, status, user_id FROM orders ORDER BY order_no DESC"
+            )
+            orders_df = pd.DataFrame(
+                orders,
+                columns=["Order No", "Game", "Amount", "Status", "User"],
+            )
+        else:
+            orders = fetch_all("SELECT game, amount, status, user_id FROM orders ORDER BY user_id, game")
+            orders_df = pd.DataFrame(orders, columns=["Game", "Amount", "Status", "User"])
+
+        col_a, col_b, col_c = st.columns(3)
+        col_a.metric("Users", len(users_df))
+        col_b.metric("Orders", len(orders_df))
+        col_c.metric(
+            "Pending Orders",
+            int((orders_df["Status"] == "pending").sum()) if not orders_df.empty else 0,
         )
-        orders = cursor.fetchall()
-        orders_df = pd.DataFrame(
-            orders,
-            columns=["Order No", "Game", "Amount", "Status", "User"],
-        )
-    else:
-        cursor.execute("SELECT game, amount, status, user_id FROM orders ORDER BY user_id, game")
-        orders = cursor.fetchall()
-        orders_df = pd.DataFrame(orders, columns=["Game", "Amount", "Status", "User"])
 
-    col_a, col_b, col_c = st.columns(3)
-    col_a.metric("Users", len(users_df))
-    col_b.metric("Orders", len(orders_df))
-    col_c.metric(
-        "Pending Orders",
-        int((orders_df["Status"] == "pending").sum()) if not orders_df.empty else 0,
-    )
+        left, right = st.columns([1.2, 1])
+        with left:
+            st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+            render_section("Users", "Registered players and their current balances.")
+            st.dataframe(users_df, use_container_width=True)
+            end_card()
 
-    left, right = st.columns([1.2, 1])
-    with left:
-        st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-        render_section("Users", "Registered players and their current balances.")
-        st.dataframe(users_df, use_container_width=True)
-        end_card()
+            st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+            render_section("Orders", "All orders across the platform.")
+            st.dataframe(orders_df, use_container_width=True)
+            end_card()
 
-        st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-        render_section("Orders", "All orders across the platform.")
-        st.dataframe(orders_df, use_container_width=True)
-        end_card()
-
-    with right:
-        st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-        render_section("Update Order Status", "Adjust the status of an existing order.")
-        try:
-            if order_numbers_enabled():
-                cursor.execute(
-                    "SELECT id, order_no, user_id, game, amount, status FROM orders ORDER BY id DESC"
-                )
-            else:
-                cursor.execute(
-                    "SELECT id, user_id, game, amount, status FROM orders ORDER BY id DESC"
-                )
-            order_rows = cursor.fetchall()
-            if order_numbers_enabled():
-                order_options = {
-                    f"{row[1]} | {row[2]} | {row[3]} | RM{row[4]} | {row[5]}": row[0]
-                    for row in order_rows
-                }
-            else:
-                order_options = {
-                    f"#{row[0]} | {row[1]} | {row[2]} | RM{row[3]} | {row[4]}": row[0]
-                    for row in order_rows
-                }
-
-            if order_options:
-                selected_label = st.selectbox("Choose an order", list(order_options.keys()))
-                new_status = st.selectbox(
-                    "New status",
-                    ["pending", "paid", "processing", "completed", "cancelled"],
-                )
-
-                if st.button("Update Order Status", key="admin_update_order"):
-                    cursor.execute(
-                        "UPDATE orders SET status=%s WHERE id=%s",
-                        (new_status, order_options[selected_label]),
+        with right:
+            st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+            render_section("Update Order Status", "Adjust the status of an existing order.")
+            try:
+                if order_numbers_enabled():
+                    order_rows = fetch_all(
+                        "SELECT id, order_no, user_id, game, amount, status FROM orders ORDER BY id DESC"
                     )
-                    conn.commit()
-                    st.success("Order status updated")
-                    st.rerun()
-            else:
-                st.info("No orders yet")
-        except psycopg2.errors.UndefinedColumn:
-            conn.rollback()
-            st.warning("The orders table has no 'id' column, so status updates are disabled.")
-        end_card()
+                else:
+                    order_rows = fetch_all(
+                        "SELECT id, user_id, game, amount, status FROM orders ORDER BY id DESC"
+                    )
+                if order_numbers_enabled():
+                    order_options = {
+                        f"{row[1]} | {row[2]} | {row[3]} | RM{row[4]} | {row[5]}": row[0]
+                        for row in order_rows
+                    }
+                else:
+                    order_options = {
+                        f"#{row[0]} | {row[1]} | {row[2]} | RM{row[3]} | {row[4]}": row[0]
+                        for row in order_rows
+                    }
+
+                if order_options:
+                    selected_label = st.selectbox("Choose an order", list(order_options.keys()))
+                    new_status = st.selectbox(
+                        "New status",
+                        ["pending", "paid", "processing", "completed", "cancelled"],
+                    )
+
+                    if st.button("Update Order Status", key="admin_update_order"):
+                        execute_write(
+                            "UPDATE orders SET status=%s WHERE id=%s",
+                            (new_status, order_options[selected_label]),
+                        )
+                        st.success("Order status updated")
+                        st.rerun()
+                else:
+                    st.info("No orders yet")
+            except psycopg2.errors.UndefinedColumn:
+                st.warning("The orders table has no 'id' column, so status updates are disabled.")
+            end_card()
+    except Exception as e:
+        st.error(f"Admin dashboard failed: {e}")
 
 
-show_user_panel()
+if choice != "Admin":
+    show_user_panel()
+elif st.session_state["user"]:
+    st.sidebar.success(f"Signed in as {st.session_state['user']}")
+    if st.sidebar.button("Logout"):
+        st.session_state["user"] = None
+        st.session_state["is_admin"] = False
+        st.rerun()
